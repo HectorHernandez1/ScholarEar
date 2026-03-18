@@ -102,14 +102,32 @@ def detect_sections(text: str) -> list[tuple[str, str]]:
     # Skips sub-sections (1.1, 2.3) so they fold into their parent section.
     # Filters out reference-style lines (number followed by author name with comma).
     toplevel_pattern = re.compile(
-        r"^\s*(\d+\.?\s+[A-Za-z][A-Za-z\s\-:,/&]{1,60})\s*$",
+        r"^\s*(\d+\.\s+[A-Za-z][A-Za-z\s\-:,/&]{1,60})\s*$",
         re.MULTILINE,
     )
-    toplevel_matches = [
-        m for m in toplevel_pattern.finditer(text)
-        if not re.match(r"^\d+\.?\s+[A-Z][a-z]+,", m.group(1).strip())  # skip "1. Birrell, ..."
-        and not re.match(r"^\d+\.?\s+[A-Z]+,", m.group(1).strip())      # skip "1. BIRRELL, ..."
-    ]
+    toplevel_matches = []
+    for m in toplevel_pattern.finditer(text):
+        heading = m.group(1).strip()
+        # Skip reference-style lines: "1. Birrell, ..." or "1. BIRRELL, ..."
+        if re.match(r"^\d+\.?\s+[A-Z][a-z]*,", heading):
+            continue
+        # Require the text after the number to be Title Case or ALL CAPS
+        title_part = re.sub(r"^\d+\.?\s+", "", heading).strip()
+        if not title_part:
+            continue
+        words = title_part.split()
+        is_allcaps = title_part == title_part.upper()
+        if len(words) < 2 and not is_allcaps:
+            continue
+        # Title case: all words start uppercase (allow short words like "of", "and", "in")
+        minor_words = {"a", "an", "the", "of", "and", "or", "in", "on", "at", "to", "for", "by", "with", "vs"}
+        is_titlecase = all(
+            w[0].isupper() or w.lower() in minor_words
+            for w in words if w
+        )
+        if not (is_allcaps or is_titlecase):
+            continue
+        toplevel_matches.append(m)
     if len(toplevel_matches) >= 3:
         best.append(("numbered", toplevel_matches, 1))
 
