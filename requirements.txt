@@ -1,0 +1,8 @@
+PyPDF2
+pdfplumber
+pymupdf
+anthropic
+edge-tts
+openai
+elevenlabs
+python-dotenv
