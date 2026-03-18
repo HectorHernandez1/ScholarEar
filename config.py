@@ -7,7 +7,7 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 TTS_VOICES = {
     "edge": "en-US-GuyNeural",
     "openai": "nova",
-    "elevenlabs": "Adam",
+    "elevenlabs": "Ember",
 }
 
 # Default TTS engine

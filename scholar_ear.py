@@ -359,6 +359,10 @@ def main():
     narration = stitch_narration(summaries, args.tts)
     generate_audio(narration, args.tts, output_path)
 
+    # Clean up: delete the source PDF
+    os.remove(pdf_path)
+    print(f"🗑️  Deleted: {args.pdf}")
+
 
 if __name__ == "__main__":
     main()

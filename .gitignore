@@ -1,4 +1,5 @@
 .env
 audio/
+papers/
 __pycache__/
 *.pyc
