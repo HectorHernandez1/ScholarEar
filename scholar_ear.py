@@ -75,27 +75,65 @@ def detect_sections(text: str) -> list[tuple[str, str]]:
     """Return list of (section_name, section_text). Falls back to chunking."""
 
     all_headings = config.SECTION_PATTERNS + config.SKIP_SECTIONS
-    # Build a regex that matches section headings on their own line
-    heading_pattern = re.compile(
-        r"^\s*(?:\d+\.?\s*)?(" + "|".join(re.escape(h) for h in all_headings) + r")\s*$",
+
+    # Strategy 1: Match known heading names (with optional numbering like "2.", "3.1")
+    known_pattern = re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?(" + "|".join(re.escape(h) for h in all_headings) + r")\s*$",
         re.IGNORECASE | re.MULTILINE,
     )
-
-    matches = list(heading_pattern.finditer(text))
-
+    matches = list(known_pattern.finditer(text))
     if len(matches) >= 2:
-        sections = []
-        for i, match in enumerate(matches):
-            name = match.group(1).strip().title()
-            start = match.end()
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-            body = text[start:end].strip()
-            if body:
-                sections.append((name, body))
-        return sections
+        return _extract_from_matches(text, matches, group=1)
+
+    # Strategy 2: Numbered headings like "2. Some Title" or "3.1 Another Title"
+    numbered_pattern = re.compile(
+        r"^\s*(\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z\s\-:,/&]{2,60})\s*$",
+        re.MULTILINE,
+    )
+    matches = list(numbered_pattern.finditer(text))
+    if len(matches) >= 3:
+        return _extract_from_matches(text, matches, group=1)
+
+    # Strategy 3: ALL-CAPS lines that look like headings (3-60 chars)
+    caps_pattern = re.compile(
+        r"^\s*([A-Z][A-Z\s\-:,/&]{2,60})\s*$",
+        re.MULTILINE,
+    )
+    matches = [m for m in caps_pattern.finditer(text) if not m.group(1).strip().isspace()]
+    if len(matches) >= 3:
+        return _extract_from_matches(text, matches, group=1)
+
+    # Strategy 4: Short standalone lines (title-case, 3-80 chars, no period at end)
+    short_line_pattern = re.compile(
+        r"^\s*([A-Z][A-Za-z\s\-:,/&]{2,78})\s*$",
+        re.MULTILINE,
+    )
+    candidates = []
+    for m in short_line_pattern.finditer(text):
+        line = m.group(1).strip()
+        # Filter: must not end with period, must be short relative to surrounding text
+        if not line.endswith(".") and len(line.split()) <= 10:
+            candidates.append(m)
+    if len(candidates) >= 3:
+        return _extract_from_matches(text, candidates, group=1)
 
     # Fallback: chunk by paragraph density
     return chunk_text(text)
+
+
+def _extract_from_matches(text: str, matches: list, group: int) -> list[tuple[str, str]]:
+    """Given regex matches for headings, extract (name, body) pairs."""
+    sections = []
+    for i, match in enumerate(matches):
+        name = match.group(group).strip()
+        # Clean up numbering prefix for display (e.g. "2. Overview" -> "Overview")
+        name = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", name).strip().title()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections.append((name, body))
+    return sections
 
 
 def chunk_text(text: str) -> list[tuple[str, str]]:

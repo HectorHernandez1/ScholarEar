@@ -1,11 +1,11 @@
 # config.py — All configurable values for ScholarEar
 
 # Claude model for summarization
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Default voice per TTS engine
 TTS_VOICES = {
-    "edge": "en-US-GuyNeural",
+    "edge": "en-US-JennyNeural",
     "openai": "nova",
     "elevenlabs": "Ember",
 }
