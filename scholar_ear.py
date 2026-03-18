@@ -71,51 +71,77 @@ def extract_text(pdf_path: str) -> tuple[str, str, int]:
 
 # ── Step 2: Detect sections ──────────────────────────────────────────────────
 
+def _normalize_text(text: str) -> str:
+    """Normalize whitespace so heading detection works reliably across extractors."""
+    # Collapse runs of 3+ newlines into 2 (paragraph break)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Remove trailing whitespace on each line
+    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
+    return text
+
+
 def detect_sections(text: str) -> list[tuple[str, str]]:
     """Return list of (section_name, section_text). Falls back to chunking."""
 
+    text = _normalize_text(text)
     all_headings = config.SECTION_PATTERNS + config.SKIP_SECTIONS
 
-    # Strategy 1: Match known heading names (with optional numbering like "2.", "3.1")
+    # Collect candidates from multiple strategies, pick the one with the most sections.
+    best = []
+
+    # Strategy 1: Match known heading names (with optional numbering, case-insensitive)
     known_pattern = re.compile(
         r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?(" + "|".join(re.escape(h) for h in all_headings) + r")\s*$",
         re.IGNORECASE | re.MULTILINE,
     )
-    matches = list(known_pattern.finditer(text))
-    if len(matches) >= 2:
-        return _extract_from_matches(text, matches, group=1)
+    known_matches = list(known_pattern.finditer(text))
+    if len(known_matches) >= 2:
+        best.append(("known", known_matches, 1))
 
-    # Strategy 2: Numbered headings like "2. Some Title" or "3.1 Another Title"
-    numbered_pattern = re.compile(
-        r"^\s*(\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z\s\-:,/&]{2,60})\s*$",
+    # Strategy 2: Top-level numbered headings only (e.g. "1. INTRODUCTION", "2. BINDING")
+    # Skips sub-sections (1.1, 2.3) so they fold into their parent section.
+    # Filters out reference-style lines (number followed by author name with comma).
+    toplevel_pattern = re.compile(
+        r"^\s*(\d+\.?\s+[A-Za-z][A-Za-z\s\-:,/&]{1,60})\s*$",
         re.MULTILINE,
     )
-    matches = list(numbered_pattern.finditer(text))
-    if len(matches) >= 3:
-        return _extract_from_matches(text, matches, group=1)
+    toplevel_matches = [
+        m for m in toplevel_pattern.finditer(text)
+        if not re.match(r"^\d+\.?\s+[A-Z][a-z]+,", m.group(1).strip())  # skip "1. Birrell, ..."
+        and not re.match(r"^\d+\.?\s+[A-Z]+,", m.group(1).strip())      # skip "1. BIRRELL, ..."
+    ]
+    if len(toplevel_matches) >= 3:
+        best.append(("numbered", toplevel_matches, 1))
 
-    # Strategy 3: ALL-CAPS lines that look like headings (3-60 chars)
+    # Strategy 3: ALL-CAPS lines (3+ chars, at least 3 letters)
     caps_pattern = re.compile(
         r"^\s*([A-Z][A-Z\s\-:,/&]{2,60})\s*$",
         re.MULTILINE,
     )
-    matches = [m for m in caps_pattern.finditer(text) if not m.group(1).strip().isspace()]
-    if len(matches) >= 3:
-        return _extract_from_matches(text, matches, group=1)
+    caps_matches = [m for m in caps_pattern.finditer(text)
+                    if sum(c.isalpha() for c in m.group(1)) >= 3]
+    if len(caps_matches) >= 3:
+        best.append(("caps", caps_matches, 1))
 
-    # Strategy 4: Short standalone lines (title-case, 3-80 chars, no period at end)
+    # Strategy 4: Short standalone lines (title-case, no trailing period, ≤10 words)
     short_line_pattern = re.compile(
         r"^\s*([A-Z][A-Za-z\s\-:,/&]{2,78})\s*$",
         re.MULTILINE,
     )
-    candidates = []
-    for m in short_line_pattern.finditer(text):
-        line = m.group(1).strip()
-        # Filter: must not end with period, must be short relative to surrounding text
-        if not line.endswith(".") and len(line.split()) <= 10:
-            candidates.append(m)
-    if len(candidates) >= 3:
-        return _extract_from_matches(text, candidates, group=1)
+    short_matches = [m for m in short_line_pattern.finditer(text)
+                     if not m.group(1).strip().endswith(".")
+                     and len(m.group(1).split()) <= 10]
+    if len(short_matches) >= 3:
+        best.append(("short", short_matches, 1))
+
+    # Pick the best strategy: prefer known headings and numbered headings over
+    # heuristic matches (caps/short lines) which are noisy.
+    # Among same-priority strategies, prefer more sections.
+    priority = {"known": 0, "numbered": 0, "caps": 1, "short": 2}
+    if best:
+        best.sort(key=lambda x: (priority.get(x[0], 9), -len(x[1])))
+        _, matches, group = best[0]
+        return _extract_from_matches(text, matches, group)
 
     # Fallback: chunk by paragraph density
     return chunk_text(text)
@@ -348,6 +374,11 @@ def main():
         default=config.DEFAULT_TTS_ENGINE,
         help="TTS engine to use (default: edge)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print candidate heading lines and skip PDF deletion",
+    )
     args = parser.parse_args()
 
     print_header()
@@ -371,6 +402,14 @@ def main():
         sys.exit(1)
     print(f"({extractor})")
     print(f"✅ Extracted {fmt_chars(len(text))} characters across {page_count} pages")
+
+    if args.debug:
+        print("\n🐛 DEBUG — Short lines (likely headings):")
+        for i, line in enumerate(text.splitlines()):
+            stripped = line.strip()
+            if stripped and len(stripped) < 80 and not stripped.endswith("."):
+                print(f"  [{i:4d}] {stripped!r}")
+        print()
 
     # Step 2: Detect sections
     sections = detect_sections(text)
@@ -397,9 +436,10 @@ def main():
     narration = stitch_narration(summaries, args.tts)
     generate_audio(narration, args.tts, output_path)
 
-    # Clean up: delete the source PDF
-    os.remove(pdf_path)
-    print(f"🗑️  Deleted: {args.pdf}")
+    # Clean up: delete the source PDF (skip in debug mode)
+    if not args.debug:
+        os.remove(pdf_path)
+        print(f"🗑️  Deleted: {args.pdf}")
 
 
 if __name__ == "__main__":
