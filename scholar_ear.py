@@ -71,113 +71,80 @@ def extract_text(pdf_path: str) -> tuple[str, str, int]:
 
 # ── Step 2: Detect sections ──────────────────────────────────────────────────
 
-def _normalize_text(text: str) -> str:
-    """Normalize whitespace so heading detection works reliably across extractors."""
-    # Collapse runs of 3+ newlines into 2 (paragraph break)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    # Remove trailing whitespace on each line
-    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
-    return text
+def detect_sections(client, text: str) -> list[tuple[str, str]]:
+    """Use Claude to identify section headings, then split text by those headings."""
+    import json
 
+    print("🔍 Detecting sections...")
 
-def detect_sections(text: str) -> list[tuple[str, str]]:
-    """Return list of (section_name, section_text). Falls back to chunking."""
-
-    text = _normalize_text(text)
-    all_headings = config.SECTION_PATTERNS + config.SKIP_SECTIONS
-
-    # Collect candidates from multiple strategies, pick the one with the most sections.
-    best = []
-
-    # Strategy 1: Match known heading names (with optional numbering, case-insensitive)
-    known_pattern = re.compile(
-        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?(" + "|".join(re.escape(h) for h in all_headings) + r")\s*$",
-        re.IGNORECASE | re.MULTILINE,
+    # Send enough text for Claude to see all headings (first ~15000 chars)
+    sample = text[:15000]
+    message = client.messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=256,
+        system=(
+            "You are a research paper parser. Given extracted text from a PDF, identify the "
+            "top-level section headings exactly as they appear in the text. Return ONLY a JSON "
+            "array of strings. No explanation, no commentary, no markdown — just the JSON array. "
+            "Include any numbering as it appears. "
+            "Skip sub-sections — only return top-level sections. "
+            "Skip References/Acknowledgments/Appendix sections. "
+            "Example: [\"Abstract\", \"1. Introduction\", \"2. Methods\", \"3. Results\", \"4. Conclusion\"]"
+        ),
+        messages=[
+            {"role": "user", "content": f"Identify the top-level section headings:\n\n{sample}"}
+        ],
     )
-    known_matches = list(known_pattern.finditer(text))
-    if len(known_matches) >= 2:
-        best.append(("known", known_matches, 1))
+    raw = message.content[0].text.strip()
 
-    # Strategy 2: Top-level numbered headings only (e.g. "1. INTRODUCTION", "2. BINDING")
-    # Skips sub-sections (1.1, 2.3) so they fold into their parent section.
-    # Filters out reference-style lines (number followed by author name with comma).
-    toplevel_pattern = re.compile(
-        r"^\s*(\d+\.\s+[A-Za-z][A-Za-z\s\-:,/&]{1,60})\s*$",
-        re.MULTILINE,
-    )
-    toplevel_matches = []
-    for m in toplevel_pattern.finditer(text):
-        heading = m.group(1).strip()
-        # Skip reference-style lines: "1. Birrell, ..." or "1. BIRRELL, ..."
-        if re.match(r"^\d+\.?\s+[A-Z][a-z]*,", heading):
-            continue
-        # Require the text after the number to be Title Case or ALL CAPS
-        title_part = re.sub(r"^\d+\.?\s+", "", heading).strip()
-        if not title_part:
-            continue
-        words = title_part.split()
-        is_allcaps = title_part == title_part.upper()
-        if len(words) < 2 and not is_allcaps:
-            continue
-        # Title case: all words start uppercase (allow short words like "of", "and", "in")
-        minor_words = {"a", "an", "the", "of", "and", "or", "in", "on", "at", "to", "for", "by", "with", "vs"}
-        is_titlecase = all(
-            w[0].isupper() or w.lower() in minor_words
-            for w in words if w
-        )
-        if not (is_allcaps or is_titlecase):
-            continue
-        toplevel_matches.append(m)
-    if len(toplevel_matches) >= 3:
-        best.append(("numbered", toplevel_matches, 1))
+    # Parse JSON array from response (handle markdown code blocks and extra text)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    # Try to extract a JSON array if Claude added extra text around it
+    json_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    if json_match:
+        cleaned = json_match.group(0)
+    try:
+        headings = json.loads(cleaned)
+    except json.JSONDecodeError:
+        print(f"⚠️  Could not parse section headings from Claude. Raw response:")
+        print(f"    {raw[:300]}")
+        print("   Falling back to chunking.")
+        return chunk_text(text)
 
-    # Strategy 3: ALL-CAPS lines (3+ chars, at least 3 letters)
-    caps_pattern = re.compile(
-        r"^\s*([A-Z][A-Z\s\-:,/&]{2,60})\s*$",
-        re.MULTILINE,
-    )
-    caps_matches = [m for m in caps_pattern.finditer(text)
-                    if sum(c.isalpha() for c in m.group(1)) >= 3]
-    if len(caps_matches) >= 3:
-        best.append(("caps", caps_matches, 1))
+    if not headings or len(headings) < 2:
+        return chunk_text(text)
 
-    # Strategy 4: Short standalone lines (title-case, no trailing period, ≤10 words)
-    short_line_pattern = re.compile(
-        r"^\s*([A-Z][A-Za-z\s\-:,/&]{2,78})\s*$",
-        re.MULTILINE,
-    )
-    short_matches = [m for m in short_line_pattern.finditer(text)
-                     if not m.group(1).strip().endswith(".")
-                     and len(m.group(1).split()) <= 10]
-    if len(short_matches) >= 3:
-        best.append(("short", short_matches, 1))
-
-    # Pick the best strategy: prefer known headings and numbered headings over
-    # heuristic matches (caps/short lines) which are noisy.
-    # Among same-priority strategies, prefer more sections.
-    priority = {"known": 0, "numbered": 0, "caps": 1, "short": 2}
-    if best:
-        best.sort(key=lambda x: (priority.get(x[0], 9), -len(x[1])))
-        _, matches, group = best[0]
-        return _extract_from_matches(text, matches, group)
-
-    # Fallback: chunk by paragraph density
-    return chunk_text(text)
-
-
-def _extract_from_matches(text: str, matches: list, group: int) -> list[tuple[str, str]]:
-    """Given regex matches for headings, extract (name, body) pairs."""
+    # Split text by the detected headings
     sections = []
-    for i, match in enumerate(matches):
-        name = match.group(group).strip()
-        # Clean up numbering prefix for display (e.g. "2. Overview" -> "Overview")
-        name = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", name).strip().title()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        if body:
-            sections.append((name, body))
-    return sections
+    for i, heading in enumerate(headings):
+        # Find the heading in the text (case-insensitive, flexible whitespace)
+        escaped = re.escape(heading)
+        # Allow flexible whitespace between words
+        pattern = r"\s*".join(escaped.split(r"\ "))
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            start = match.end()
+            # Find where the next heading starts
+            end = len(text)
+            for next_heading in headings[i + 1:]:
+                next_escaped = re.escape(next_heading)
+                next_pattern = r"\s*".join(next_escaped.split(r"\ "))
+                next_match = re.search(next_pattern, text[start:], re.IGNORECASE)
+                if next_match:
+                    end = start + next_match.start()
+                    break
+
+            body = text[start:end].strip()
+            # Clean heading name: remove numbering prefix
+            name = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip().title()
+            if body:
+                sections.append((name, body))
+
+    if len(sections) >= 2:
+        return sections
+
+    return chunk_text(text)
 
 
 def chunk_text(text: str) -> list[tuple[str, str]]:
@@ -335,17 +302,23 @@ def tts_elevenlabs(text: str, output_path: str) -> None:
     from elevenlabs import save
     client = ElevenLabs(api_key=api_key)
 
-    # Resolve voice name to voice_id
+    import requests as req
     voice_name = config.TTS_VOICES["elevenlabs"]
+
+    # Look up voice_id by name via API
+    resp = req.get(
+        "https://api.elevenlabs.io/v1/voices",
+        headers={"xi-api-key": api_key},
+    )
+    resp.raise_for_status()
     voice_id = None
-    voices_response = client.voices.get_all()
-    for voice in voices_response.voices:
-        if voice.name.lower() == voice_name.lower():
-            voice_id = voice.voice_id
+    for v in resp.json().get("voices", []):
+        if v["name"].lower() == voice_name.lower():
+            voice_id = v["voice_id"]
             break
     if not voice_id:
         print(f"⚠️  Voice '{voice_name}' not found. Using first available voice.")
-        voice_id = voices_response.voices[0].voice_id
+        voice_id = resp.json()["voices"][0]["voice_id"]
 
     audio = client.text_to_speech.convert(
         voice_id=voice_id,
@@ -429,18 +402,18 @@ def main():
                 print(f"  [{i:4d}] {stripped!r}")
         print()
 
-    # Step 2: Detect sections
-    sections = detect_sections(text)
+    # Step 2: Detect sections (uses Claude)
+    client = get_claude_client()
+    sections = detect_sections(client, text)
     sections = filter_sections(sections)
     if not sections:
         print("❌ No usable content found in PDF.")
         sys.exit(1)
 
     section_names = [name for name, _ in sections]
-    print(f"🔍 Detected {len(sections)} sections: {', '.join(section_names)}")
+    print(f"✅ Detected {len(sections)} sections: {', '.join(section_names)}")
 
     # Step 3: Summarize with Claude
-    client = get_claude_client()
     summaries = summarize_sections(client, sections)
 
     # Step 4: Generate semantic filename
